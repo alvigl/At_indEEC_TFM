@@ -1,0 +1,866 @@
+---
+title: "TFM_COMPLETO"
+output: html_document
+date: "2026-05-18"
+---
+
+## Lectura y nombres de la matriz
+
+```{r}
+# 1. Leer la matriz original sacada del servidor
+# row.names = 1 le dice que la primera columna son los nombres de los genes (gene_id)
+matriz_cruda <- read.csv("matriz_genes.csv", row.names = 1)
+
+# 2. Seleccionar automáticamente solo mis 12 columnas
+# grep("DEX") busca todas las columnas que pertenecen al experimento
+columnas_tuyas <- grep("DEX", colnames(matriz_cruda), value = TRUE)
+matriz_12_replicas <- matriz_cruda[, columnas_tuyas]
+
+# 3. Guardar la matriz limpia
+write.csv(matriz_12_replicas, file = "matriz_DEX_completa_12_muestras.csv", quote = FALSE)
+```
+
+```{r}
+# Lectura de la matriz de conteos.
+raw_data <- read.csv("matriz_DEX_completa_12_muestras.csv", row.names = 1)
+
+# Limpiar la matriz
+colnames(raw_data)
+
+nombres_nuevos_raw <- c(
+  "minus_DEX_3D_L1",
+  "minus_DEX_3D_L2",
+  "minus_DEX_4D_L1_1",
+  "minus_DEX_4D_L1_2",
+  "minus_DEX_4D_L2_1",
+  "minus_DEX_4D_L2_2",
+  "minus_DEX_4D_O1_1",
+  "minus_DEX_4D_O1_2",
+  "minus_DEX_4D_O2_1",
+  "minus_DEX_4D_O2_2",
+  "plus_DEX_4D_L1",
+  "plus_DEX_4D_L2"
+)
+```
+
+## Limpiar los gene ids de la matriz y establecer un filtro de CPM
+
+```{r}
+# Sustituir los nombres antiguos por los nuevos
+colnames(raw_data) <- nombres_nuevos_raw
+
+# Visualizar las primeras filas para comprobar la matriz
+head(raw_data)
+
+# Limpiar los nombres de los genes (rownames)
+# La función gsub busca un patrón de texto y lo sustituye por otro (en este caso, por "" para borrarlo)
+rownames(raw_data) <- gsub("\\|.*", "", rownames(raw_data))
+
+# Ver las primeras líneas para comprobar la matriz
+head(raw_data)
+
+gene.expression.raw <- as.matrix(raw_data)
+
+library(edgeR)
+
+# Crear el objeto DGEList usando la matriz de conteos brutos
+d0.raw <- DGEList(counts = gene.expression.raw)
+dim(d0.raw) # Muestra los 32833 genes originales
+
+# Calcular factores de normalización (TMM por defecto)
+d0.raw.norm <- calcNormFactors(d0.raw) 
+
+# Filtrar genes poco expresados, eliminando los genes cuyo valor máximo de CPM en las 28 muestras no llega a 2
+cutoff <- 1
+drop.raw <- which(apply(cpm(d0.raw.norm), 1, max) < cutoff)
+
+# Ejecutar el filtro
+d.raw <- d0.raw.norm[-drop.raw, ] 
+dim(d.raw) # Muestra cuántos genes han pasado el filtro
+
+
+gene.expression.raw <- d.raw$counts
+gene.ids.raw <- rownames(gene.expression.raw)
+
+# Para normalizar los datos de expresión génica se usa log2(), para ello se le suma 1 a toda la matriz de expresión
+gene.expression.raw.1 <- gene.expression.raw + 1
+
+write.table(x = gene.expression.raw.1,file = "total_gene_expression.tsv",
+            quote = F,row.names = F,
+            sep = "\t")
+```
+
+## Boxplot
+
+```{r}
+boxplot(gene.expression.raw,outline=F,las=2,ylab="Gene Expression (TPM)",
+        col=rep(c("blue","lightblue","salmon","red"),each=3))
+
+boxplot(log2(gene.expression.raw+1),outline=F,las=2,ylab="Gene Expression log2(TPM + 1)",
+        col=rep(c("blue","lightblue","salmon","red"),each=3))
+```
+
+## Normalizar
+
+```{r}
+library(NormalyzerDE)
+
+# Generamos el diseño experimental
+design.raw <- data.frame(sample=colnames(gene.expression.raw),
+                     group=c(rep("minus_DEX_3D_L",2),
+                             rep("minus_DEX_4D_L",4),
+                             rep("minus_DEX_4D_O",4),
+                             rep("plus_DEX_4D",2)))
+
+design.raw
+
+# Guardamos el diseño experimental como .tsv
+write.table(x = design.raw,file = "normalyzer_design.raw.tsv",quote = F,row.names = F,
+            sep = "\t")
+
+# Corremos la función normalyzer para normalizar los datos de la matriz y generar las métricas
+normalyzer(jobName = "embryo_stage",designPath = "normalyzer_design.raw.tsv",
+          dataPath = "total_gene_expression.tsv",outputDir = ".")
+
+# Elegimos "Quantile-normalized" como la mejor vía de normalización de los datos
+quantile.normalized.gene.expression.raw <- read.table(file="embryo_stage/Quantile-normalized.txt", 
+                                         header=T)
+
+rownames(quantile.normalized.gene.expression.raw) <- gene.ids.raw
+head(quantile.normalized.gene.expression.raw)
+```
+
+## Boxplot normalizado por quantiles
+
+```{r}
+boxplot(quantile.normalized.gene.expression.raw, outline=F,col=rep(c("blue","lightblue","salmon","red"),each=2),
+        ylab="Quantile-Normalyzer",las=2)
+```
+
+## PCA
+
+```{r}
+library(FactoMineR)
+library(factoextra)
+
+# -------------------------------------------------------------------------
+# 1. PREPARACIÓN DE LA TABLA Y GRUPOS
+# -------------------------------------------------------------------------
+datos_transpuestos_raw <- as.data.frame(t(quantile.normalized.gene.expression.raw))
+
+# Creamos un vector para decirle a R cuáles son los 4 grupos biológicos reales
+# (El orden coincide con cómo están ordenadas las muestras en la matriz)
+grupos_condicion <- factor(c(
+  rep("-DEX 3D light", 2),
+  rep("-DEX 4D light", 4),
+  rep("-DEX 4D Dark", 4),
+  rep("+DEX 4D light", 2)
+), levels = c("+DEX 4D light", "-DEX 3D light", "-DEX 4D light", "-DEX 4D Dark"))
+
+# -------------------------------------------------------------------------
+# 2. CÁLCULO DEL PCA
+# -------------------------------------------------------------------------
+res.pca.raw <- PCA(datos_transpuestos_raw, graph = FALSE, scale.unit = TRUE)
+
+# -------------------------------------------------------------------------
+# 3. COLORES (Agrupados por los 4 tratamientos)
+# -------------------------------------------------------------------------
+colores_grupos <- c(
+  "+DEX 4D light" = "#EEDF9F", 
+  "-DEX 3D light" = "#A8C66C", 
+  "-DEX 4D light" = "#00B050", 
+  "-DEX 4D Dark"  = "#000000"  
+)
+
+# -------------------------------------------------------------------------
+# 4. DIBUJAR EL PCA DEFINITIVO (SIN TEXTO)
+# -------------------------------------------------------------------------
+fviz_pca_ind(res.pca.raw,
+             geom = "point",                 
+             fill.ind = grupos_condicion,    
+             col.ind = "black",             
+             palette = colores_grupos,       
+             pointsize = 5,                 
+             pointshape = 21,                
+             addEllipses = FALSE,
+             mean.point = FALSE,
+             title = "PCA") +
+  theme_classic() +                          
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 18),
+    legend.position = c(0.85, 0.85),
+    legend.title = element_blank(),
+    legend.background = element_rect(fill = "transparent"), # Leyenda transparente
+    legend.text = element_text(size = 12),
+    axis.title = element_text(size = 12, color = "black"),
+    axis.text = element_text(color = "black")
+  )
+```
+
+```{r}
+# Hacemos la media de expresión de ambas réplicas para cada condición
+matriz_medias_hp_raw <- data.frame(
+  plusDEX_4D_L  = rowMeans(quantile.normalized.gene.expression.raw[, c("plus_DEX_4D_L1", "plus_DEX_4D_L2")]),
+  minusDEX_3D_L = rowMeans(quantile.normalized.gene.expression.raw[, c("minus_DEX_3D_L1", "minus_DEX_3D_L2")]),
+  minusDEX_4D_L = rowMeans(quantile.normalized.gene.expression.raw[, c("minus_DEX_4D_L1_1",
+                                                                       "minus_DEX_4D_L1_2",
+                                                                       "minus_DEX_4D_L2_1",
+                                                                       "minus_DEX_4D_L2_2")]),
+  minusDEX_4D_O = rowMeans(quantile.normalized.gene.expression.raw[, c("minus_DEX_4D_O1_1", 
+                                                                       "minus_DEX_4D_O1_2",
+                                                                       "minus_DEX_4D_O2_1",
+                                                                       "minus_DEX_4D_O2_2")])
+)
+```
+
+# DEGs con limma
+
+```{r}
+library(limma)
+
+# Le decimos a limma que mire directamente la columna 'group' de la tabla 'design'
+experimental.design.raw <- model.matrix(~ -1 + factor(design.raw$group))
+
+# Limpiamos los nombres que pone R por defecto
+colnames(experimental.design.raw) <- levels(factor(design.raw$group))
+
+# Visualizamos el resultado
+experimental.design.raw
+
+# Ajuste del modelo lineal 
+linear.fit.raw <- lmFit(quantile.normalized.gene.expression.raw, experimental.design.raw)
+```
+
+## CONTRASTES DEX
+
+```{r}
+# Crear la matriz de contrastes
+contrast.matrix <- makeContrasts(
+  # (Lo que quiero ver - El Control):
+  
+  Efecto_DEX_1 = plus_DEX_4D - minus_DEX_4D_O,
+  
+  Efecto_DEX_2 = plus_DEX_4D - minus_DEX_3D_L,
+  
+  Efecto_DEX_3 = plus_DEX_4D - minus_DEX_4D_L,
+  
+  levels = colnames(experimental.design.raw) 
+)
+
+# Ver la matriz resultante
+contrast.matrix
+
+## Linear fit to contrasts specification, log2fc calculation.
+## pvalues and adjusted pvalues are computed using a moderated t-student
+## empirical Bayes methods are also used 
+contrast.linear.fit.raw <- contrasts.fit(linear.fit.raw, contrast.matrix)
+contrast.results <- eBayes(contrast.linear.fit.raw)
+```
+
+```{r}
+dex.minusdex <- topTable(contrast.results, 
+                      number=nrow(quantile.normalized.gene.expression.raw),
+                      coef=1,
+                      sort.by="logFC")
+
+## DEGs extraction
+limma.log2fc <- dex.minusdex$logFC
+limma.adjusted.pval <- dex.minusdex$adj.P.Val 
+limma.genes.ids <- rownames(dex.minusdex)
+
+names(limma.log2fc) <- limma.genes.ids
+names(limma.adjusted.pval) <- limma.genes.ids
+
+limma.activated.genes.1_DEX <- limma.genes.ids[limma.log2fc > 1 & 
+                                          limma.adjusted.pval < 0.05]
+limma.repressed.genes.1_DEX <- limma.genes.ids[limma.log2fc < - 1 & 
+                                          limma.adjusted.pval < 0.05]
+
+### ----------------------------------------------------------------------------
+
+dex.minusdex <- topTable(contrast.results, 
+                      number=nrow(quantile.normalized.gene.expression.raw),
+                      coef=2,
+                      sort.by="logFC")
+
+## DEGs extraction
+limma.log2fc <- dex.minusdex$logFC
+limma.adjusted.pval <- dex.minusdex$adj.P.Val 
+limma.genes.ids <- rownames(dex.minusdex)
+
+names(limma.log2fc) <- limma.genes.ids
+names(limma.adjusted.pval) <- limma.genes.ids
+
+limma.activated.genes.2_DEX <- limma.genes.ids[limma.log2fc > 1 & 
+                                          limma.adjusted.pval < 0.05]
+limma.repressed.genes.2_DEX <- limma.genes.ids[limma.log2fc < - 1 & 
+                                          limma.adjusted.pval < 0.05]
+
+### ----------------------------------------------------------------------------
+
+dex.minusdex <- topTable(contrast.results, 
+                      number=nrow(quantile.normalized.gene.expression.raw),
+                      coef=3,
+                      sort.by="logFC")
+
+## DEGs extraction
+limma.log2fc <- dex.minusdex$logFC
+limma.adjusted.pval <- dex.minusdex$adj.P.Val 
+limma.genes.ids <- rownames(dex.minusdex)
+
+names(limma.log2fc) <- limma.genes.ids
+names(limma.adjusted.pval) <- limma.genes.ids
+
+limma.activated.genes.3_DEX <- limma.genes.ids[limma.log2fc > 1 & 
+                                          limma.adjusted.pval < 0.05]
+limma.repressed.genes.3_DEX <- limma.genes.ids[limma.log2fc < - 1 & 
+                                          limma.adjusted.pval < 0.05]
+
+```
+
+
+## CONTRASTES LUZ - OSC
+
+```{r}
+# Crear la matriz de contrastes
+contrast.matrix.luz <- makeContrasts(
+  
+  Efecto_LUZ_1 = minus_DEX_4D_L - minus_DEX_4D_O,
+  levels = colnames(experimental.design.raw) 
+)
+
+# Ver la matriz resultante
+contrast.matrix.luz
+
+## Linear fit to contrasts specification, log2fc calculation.
+## pvalues and adjusted pvalues are computed using a moderated t-student
+## empirical Bayes methods are also used 
+contrast.linear.fit.raw.luz <- contrasts.fit(linear.fit.raw, contrast.matrix.luz)
+contrast.results.luz <- eBayes(contrast.linear.fit.raw.luz)
+```
+
+```{r}
+light.dark <- topTable(contrast.results.luz, 
+                      number=nrow(quantile.normalized.gene.expression.raw),
+                      coef=1,
+                      sort.by="logFC")
+
+## DEGs extraction
+limma.log2fc <- light.dark$logFC
+limma.adjusted.pval <- light.dark$adj.P.Val 
+limma.genes.ids <- rownames(light.dark)
+
+names(limma.log2fc) <- limma.genes.ids
+names(limma.adjusted.pval) <- limma.genes.ids
+
+limma.activated.genes.1_LD <- limma.genes.ids[limma.log2fc > 1 & 
+                                          limma.adjusted.pval < 0.05]
+limma.repressed.genes.1_LD <- limma.genes.ids[limma.log2fc < - 1 & 
+                                          limma.adjusted.pval < 0.05]
+
+```
+
+
+## CONTRASTES TIEMPO EN LUZ
+
+```{r}
+# Crear la matriz de contrastes
+contrast.matrix.luz.t <- makeContrasts(
+  
+  Efecto_t_LUZ = minus_DEX_3D_L - minus_DEX_4D_L,
+  levels = colnames(experimental.design.raw) 
+)
+
+# Ver la matriz resultante
+contrast.matrix.luz.t
+
+## Linear fit to contrasts specification, log2fc calculation.
+## pvalues and adjusted pvalues are computed using a moderated t-student
+## empirical Bayes methods are also used 
+contrast.linear.fit.raw.luz.t <- contrasts.fit(linear.fit.raw, contrast.matrix.luz.t)
+contrast.results.luz.t <- eBayes(contrast.linear.fit.raw.luz.t)
+```
+
+```{r}
+t.light <- topTable(contrast.results.luz.t, 
+                      number=nrow(quantile.normalized.gene.expression.raw),
+                      coef=1,
+                      sort.by="logFC")
+
+## DEGs extraction
+limma.log2fc <- t.light$logFC
+limma.adjusted.pval <- t.light$adj.P.Val 
+limma.genes.ids <- rownames(t.light)
+
+names(limma.log2fc) <- limma.genes.ids
+names(limma.adjusted.pval) <- limma.genes.ids
+
+limma.activated.genes_T <- limma.genes.ids[limma.log2fc > 1 & 
+                                          limma.adjusted.pval < 0.05]
+limma.repressed.genes_T <- limma.genes.ids[limma.log2fc < - 1 & 
+                                          limma.adjusted.pval < 0.05]
+```
+
+
+## HEATMAP
+
+
+```{r}
+library(gplots)
+
+# 1. Juntamos TODOS los genes de todos los contrastes
+genes_DEX       <- unique(c(limma.activated.genes.1_DEX, limma.repressed.genes.1_DEX))
+genes_DEX_2     <- unique(c(limma.activated.genes.2_DEX, limma.repressed.genes.2_DEX))
+genes_DEX_3     <- unique(c(limma.activated.genes.3_DEX, limma.repressed.genes.3_DEX))
+
+genes_Luz_Osc   <- unique(c(limma.activated.genes.1_LD, limma.repressed.genes.1_LD))
+
+genes_Tiempo   <- unique(c(limma.activated.genes_T, limma.repressed.genes_T))
+
+# 2. Creamos la SUPER LISTA
+# Usamos unique() por si un gen es diferencial en Luz y también en DEX, que solo aparezca 1 vez
+super_lista_genes <- unique(c(genes_DEX, genes_DEX_2, genes_DEX_3, genes_Luz_Osc, genes_Tiempo))
+
+# 3. Filtramos la matriz normalizada
+tabla_global_medias <- matriz_medias_hp_raw[rownames(matriz_medias_hp_raw) %in% super_lista_genes, ]
+tabla_global_medias <- tabla_global_medias[complete.cases(tabla_global_medias), ]
+
+# 4. Establecemos el nuevo orden: plus DEX primero, Luz en medio, Oscuridad al final
+orden_logico <- c(
+  "plusDEX_4D_L",
+  "minusDEX_3D_L", "minusDEX_4D_L",
+  "minusDEX_4D_O" 
+)
+```
+
+## HEATMAP 2 CLUSTERS INTRO
+
+```{r}
+genes_DEX_intro <- unique(c(limma.activated.genes.3_DEX, limma.repressed.genes.3_DEX))
+tabla_global_medias <- matriz_medias_hp_raw[rownames(matriz_medias_hp_raw) %in% genes_DEX_intro, ]
+tabla_global_medias <- tabla_global_medias[complete.cases(tabla_global_medias), ]
+
+library(pheatmap)
+library(viridis)
+
+# 1. Escalamos los datos y calculamos los clústeres
+genes_heat_global <- t(scale(t(as.matrix(tabla_global_medias[, orden_logico]))))
+dist_genes <- as.dist(1 - cor(t(genes_heat_global)))
+hc_genes   <- hclust(dist_genes, method = "ward.D2")
+
+# 1.2 ORDENAR LAS RAMAS
+dend_genes <- as.dendrogram(hc_genes)
+dend_reordenado <- reorder(dend_genes, wts = genes_heat_global[, "plusDEX_4D_L"], agglo.FUN = mean)
+
+# 2. Definimos los clústeres y cortamos el árbol
+num_clusters <- 2
+# -------------------------------------------------------------------------
+# 2.1 EL HEATMAP OCULTO (Corregido para usar la matriz y árbol correctos)
+# -------------------------------------------------------------------------
+mi_heatmap_oculto <- pheatmap(mat     = genes_heat_global, 
+                              cluster_rows = as.hclust(dend_reordenado),
+                              cluster_cols = FALSE,
+                              cutree_rows  = num_clusters, 
+                              silent       = TRUE)
+
+# -------------------------------------------------------------------------
+# 3. TRADUCTOR DE CLÚSTERES
+# -------------------------------------------------------------------------
+clusters_brutos <- cutree(mi_heatmap_oculto$tree_row, k = num_clusters)
+orden_visual <- mi_heatmap_oculto$tree_row$order
+orden_aparicion <- unique(clusters_brutos[orden_visual])
+
+traductor <- setNames(1:num_clusters, orden_aparicion)
+clusters_nuevos <- traductor[as.character(clusters_brutos)]
+
+# Creamos la tablita de anotación
+anotacion_filas <- data.frame(Cluster = factor(paste("Cluster", clusters_nuevos)))
+rownames(anotacion_filas) <- names(clusters_brutos)
+
+# -------------------------------------------------------------------------
+# 4. COLORES
+# -------------------------------------------------------------------------
+colores_elegantes <- c("#1A39A3", "#E7FA37") 
+
+names(colores_elegantes) <- paste("Cluster", 1:num_clusters) 
+
+mis_colores <- list(Cluster = colores_elegantes)
+
+mis_cortes <- seq(-1.5, 1.5, length.out = 101)
+
+# -------------------------------------------------------------------------
+# 5. HEATMAP
+# -------------------------------------------------------------------------
+pheatmap(
+  mat               = genes_heat_global, 
+  scale             = "none",              
+  cluster_rows      = as.hclust(dend_reordenado),            
+  cluster_cols      = FALSE,              
+  show_rownames     = FALSE,
+  show_colnames     = TRUE,
+  labels_col        = c("+DEX 4D light", "-DEX 3D light", "-DEX 4D light", "-DEX 4D dark"),
+  color             = viridis(100),
+  breaks            = mis_cortes,
+  cutree_rows       = num_clusters,        
+  annotation_row    = anotacion_filas,    
+  annotation_colors = mis_colores,        
+  annotation_legend = TRUE,
+  angle_col         = "45",
+  main              = "DEGs in +DEX 4D & -DEX 4D (n=10342 genes log2FC > 1)"
+)
+```
+
+## PERFILES DE EXPRESIÓN
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Filtramos la matriz original
+tabla_DEX_medias <- matriz_medias_hp_raw[rownames(matriz_medias_hp_raw) %in% genes_DEX_intro, ]
+tabla_DEX_medias <- tabla_DEX_medias[complete.cases(tabla_DEX_medias), ]
+
+# Escalamos los datos a Z-score
+genes_heat_DEX <- t(scale(t(as.matrix(tabla_DEX_medias[, orden_logico]))))
+
+# 1. Recuperar los clústeres EXACTOS directamente del heatmap
+datos_perfiles <- as.data.frame(genes_heat_DEX)
+
+# Extraemos la columna 'Cluster' de la tabla 'anotacion_filas' que creamos para el heatmap
+datos_perfiles$Cluster <- anotacion_filas$Cluster[match(rownames(datos_perfiles), rownames(anotacion_filas))]
+datos_perfiles$Gene <- rownames(datos_perfiles)
+
+# 2. Pasar de formato ancho a largo (formato 'tidy' para ggplot)
+datos_largos <- datos_perfiles %>%
+  pivot_longer(
+    cols = -c(Gene, Cluster),
+    names_to = "Condicion",
+    values_to = "Z_score"
+  )
+
+# 3. Forzar el orden cronológico en el eje X
+orden_condiciones <- c("plusDEX_4D_L", "minusDEX_3D_L", "minusDEX_4D_L", "minusDEX_4D_O")
+datos_largos$Condicion <- factor(datos_largos$Condicion, levels = orden_condiciones)
+
+# 4. Calcular medias y SD
+resumen_perfiles <- datos_largos %>%
+  group_by(Cluster, Condicion) %>%
+  summarise(
+    Media = mean(Z_score, na.rm = TRUE),
+    SD = sd(Z_score, na.rm = TRUE),
+    N = n_distinct(Gene),
+    .groups = "drop"
+  ) %>%
+  mutate(Label_Cluster = paste0(Cluster, " (n=", N, ")"))
+
+# 5. Definir colores
+colores_perfiles <- c("Cluster 1" = "#1A39A3", "Cluster 2" = "#E7FA37") 
+
+# 6. Dibujar el gráfico
+ggplot(resumen_perfiles, aes(x = Condicion, y = Media, group = Cluster)) +
+  geom_ribbon(aes(ymin = Media - SD, ymax = Media + SD, fill = Cluster), alpha = 0.2) +
+  geom_line(aes(color = Cluster), size = 1) +
+  geom_point(aes(color = Cluster), size = 2) +
+  facet_wrap(~ Label_Cluster) +
+  scale_color_manual(values = colores_perfiles) +
+  scale_fill_manual(values = colores_perfiles) +
+  scale_x_discrete(labels = c(
+    "plusDEX_4D_L"  = "+DEX 4D light",
+    "minusDEX_3D_L" = "-DEX 3D light",
+    "minusDEX_4D_L" = "-DEX 4D light",
+    "minusDEX_4D_O" = "-DEX 4D dark"
+  )) +
+  labs(
+    x = "",
+    y = "Z-score (Media ± SD)"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold", color = "black"),
+    axis.text.y = element_text(color = "black"),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(size = 12, face = "bold")
+  )
+```
+
+## ENRIQUECIMIENTO
+
+```{r}
+library(clusterProfiler)
+library(org.At.tair.db)
+library(dplyr)
+library(stringr)
+
+anotacion_intro <- data.frame(Cluster = factor(paste("Cluster", clusters_nuevos)))
+rownames(anotacion_intro) <- names(clusters_brutos)
+
+# 1. CREAR LA LISTA USANDO LA VARIABLE AISLADA
+lista_clusters_intro <- split(rownames(anotacion_intro), anotacion_intro$Cluster)
+
+# 2. EJECUTAR EL ENRIQUECIMIENTO GO
+comparacion_intro_go <- compareCluster(
+  geneCluster   = lista_clusters_intro,
+  fun           = "enrichGO",
+  OrgDb         = org.At.tair.db,
+  ont           = "BP",
+  keyType       = "TAIR",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05
+)
+
+# -------------------------------------------------------------------------
+# 3. SIMPLIFICAR Y CALCULAR FOLD ENRICHMENT
+# -------------------------------------------------------------------------
+# Simplificamos para no tener 20 términos de respuesta a luz idénticos
+comparacion_intro_limpia <- simplify(comparacion_intro_go, cutoff = 0.7, by = "p.adjust", select_fun = min)
+
+# Calculamos el Fold Enrichment
+comparacion_intro_FE <- mutate(comparacion_intro_limpia, 
+                               FoldEnrichment = parse_ratio(GeneRatio) / parse_ratio(BgRatio))
+
+# -------------------------------------------------------------------------
+# 4. DIBUJAR EL DOTPLOT
+# -------------------------------------------------------------------------
+dotplot(comparacion_intro_FE, x = "FoldEnrichment", showCategory = 10) + 
+  facet_wrap(~ Cluster, nrow = 1, scales = "free_x") + 
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 50)) + 
+  theme_bw(base_size = 14) +
+  
+  scale_color_gradientn(colors = c("#1A39A3", "#E7FA37"), 
+                        name = "p.adjust", trans = "log10") +
+  
+  labs(title = "Global GO Biological Processes", 
+       x = "Fold Enrichment", y = "") +
+  theme(axis.text.y = element_text(size = 11, lineheight = 0.8), 
+        strip.text = element_text(face = "bold", size = 12), 
+        strip.background = element_rect(fill = "white", color = "black"))
+
+# ggsave("Dotplot_Intro_2Clusters.png", width = 12, height = 7, dpi = 300, bg = "white")
+```
+
+## HEATMAP LD 3D4D
+
+```{r}
+# 1. Juntamos los genes del desarrollo normal (Luz/Oscuridad y Tiempo)
+super_lista_genes_LD_3D4D <- unique(c(genes_Luz_Osc, genes_Tiempo))
+
+# 2. EL PASO CLAVE: Nos quedamos SOLO con los que también son afectados por DEX
+genes_interseccion <- unique(super_lista_genes_LD_3D4D, genes_DEX_intro)
+
+# 3. Filtramos tu matriz normalizada usando esta lista cruzada (que tendrá ~2848 genes)
+tabla_global_medias_LD_3D4D <- matriz_medias_hp_raw[rownames(matriz_medias_hp_raw) %in% genes_interseccion, ]
+tabla_global_medias_LD_3D4D <- tabla_global_medias_LD_3D4D[complete.cases(tabla_global_medias_LD_3D4D), ]
+```
+
+
+```{r}
+library(pheatmap)
+library(viridis)
+
+# 1. Escalamos los datos usando tu nueva matriz cruzada (la de los ~2848 genes)
+genes_heat_LD_3D4D <- t(scale(t(as.matrix(tabla_global_medias_LD_3D4D[, orden_logico]))))
+dist_genes <- as.dist(1 - cor(t(genes_heat_LD_3D4D)))
+hc_genes   <- hclust(dist_genes, method = "ward.D2")
+
+# 1.2 EL TRUCO PARA ORDENAR LAS RAMAS
+dend_genes <- as.dendrogram(hc_genes)
+dend_reordenado <- reorder(dend_genes, wts = genes_heat_LD_3D4D[, "plusDEX_4D_L"], agglo.FUN = mean)
+
+# 2. Definimos los clústeres y cortamos el árbol (¡Ajustado a 6 como en el PDF!)
+num_clusters <- 6
+
+# -------------------------------------------------------------------------
+# 2. EL HEATMAP OCULTO
+# -------------------------------------------------------------------------
+mi_heatmap_oculto <- pheatmap(mat      = genes_heat_LD_3D4D, 
+                              cluster_rows = as.hclust(dend_reordenado),
+                              cluster_cols = FALSE,
+                              cutree_rows  = num_clusters, 
+                              silent       = TRUE)
+
+# -------------------------------------------------------------------------
+# 3. TRADUCTOR DE CLÚSTERES (Visual a Matemático)
+# -------------------------------------------------------------------------
+clusters_brutos <- cutree(mi_heatmap_oculto$tree_row, k = num_clusters)
+orden_visual <- mi_heatmap_oculto$tree_row$order
+orden_aparicion <- unique(clusters_brutos[orden_visual])
+
+traductor <- setNames(1:num_clusters, orden_aparicion)
+clusters_nuevos <- traductor[as.character(clusters_brutos)]
+
+# Creamos la tablita de anotación
+anotacion_filas <- data.frame(Cluster = factor(paste("Cluster", clusters_nuevos)))
+rownames(anotacion_filas) <- names(clusters_brutos)
+
+# -------------------------------------------------------------------------
+# 4. COLORES PARA 6 CLÚSTERES
+# -------------------------------------------------------------------------
+# He puesto una paleta de 6 colores vivos y muy diferenciables (estilo a los del paper)
+colores_seis <- c("#F8766D", "#B79F00", "#00BA38", "#00BFC4", "#619CFF", "#F564E3") 
+
+names(colores_seis) <- paste("Cluster", 1:num_clusters) 
+mis_colores <- list(Cluster = colores_seis)
+
+mis_cortes <- seq(-1.5, 1.5, length.out = 101)
+
+# -------------------------------------------------------------------------
+# 5. HEATMAP DEFINITIVO
+# -------------------------------------------------------------------------
+pheatmap(
+  mat               = genes_heat_LD_3D4D, 
+  scale             = "none",              
+  cluster_rows      = as.hclust(dend_reordenado),            
+  cluster_cols      = FALSE,              
+  show_rownames     = FALSE,
+  show_colnames     = TRUE,
+  labels_col        = c("+DEX 4D light", "-DEX 3D light", "-DEX 4D light", "-DEX 4D dark"),
+  color             = viridis(100),
+  breaks            = mis_cortes,
+  cutree_rows       = num_clusters,        
+  annotation_row    = anotacion_filas,    
+  annotation_colors = mis_colores,        
+  annotation_legend = TRUE,
+  angle_col         = "45",
+  # Título actualizado con la cifra correcta y la descripción del PDF
+  main              = "DEGs at -DEX 3D and 4D light/dark comparisons (n=3952 genes log2FC > 1)"
+)
+```
+
+## PERFILES
+
+```{r}
+# Cargar las librerías necesarias
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# 1. Recuperar los clústeres EXACTOS directamente de la matriz que ya escalamos
+datos_perfiles <- as.data.frame(genes_heat_LD_3D4D)
+
+# Extraemos la columna 'Cluster' de la tabla 'anotacion_filas' de tu heatmap de 6 clústeres
+datos_perfiles$Cluster <- anotacion_filas$Cluster[match(rownames(datos_perfiles), rownames(anotacion_filas))]
+datos_perfiles$Gene <- rownames(datos_perfiles)
+
+# 2. Pasar de formato ancho a largo (formato 'tidy' para ggplot)
+datos_largos <- datos_perfiles %>%
+  pivot_longer(
+    cols = -c(Gene, Cluster),
+    names_to = "Condicion",
+    values_to = "Z_score"
+  )
+
+# 3. Forzar el orden cronológico en el eje X
+orden_condiciones <- c("plusDEX_4D_L", "minusDEX_3D_L", "minusDEX_4D_L", "minusDEX_4D_O")
+datos_largos$Condicion <- factor(datos_largos$Condicion, levels = orden_condiciones)
+
+# 4. Calcular medias y SD
+resumen_perfiles <- datos_largos %>%
+  group_by(Cluster, Condicion) %>%
+  summarise(
+    Media = mean(Z_score, na.rm = TRUE),
+    SD = sd(Z_score, na.rm = TRUE),
+    N = n_distinct(Gene),
+    .groups = "drop"
+  ) %>%
+  # El nombre respetará el formato exacto del heatmap ("Cluster 1 (n=X)")
+  mutate(Label_Cluster = paste0(Cluster, " (n=", N, ")"))
+
+# 5. Definir los 6 colores EXACTOS sincronizados con tu heatmap
+colores_perfiles <- c(
+  "Cluster 1" = "#F8766D", 
+  "Cluster 2" = "#B79F00", 
+  "Cluster 3" = "#00BA38", 
+  "Cluster 4" = "#00BFC4", 
+  "Cluster 5" = "#619CFF", 
+  "Cluster 6" = "#F564E3"
+)
+
+# 6. Dibujar el gráfico
+ggplot(resumen_perfiles, aes(x = Condicion, y = Media, group = Cluster)) +
+  geom_ribbon(aes(ymin = Media - SD, ymax = Media + SD, fill = Cluster), alpha = 0.2) +
+  geom_line(aes(color = Cluster), size = 1) +
+  geom_point(aes(color = Cluster), size = 2) +
+  
+  # ¡LA CLAVE DEL DISEÑO!: nrow = 1 fuerza a que todos salgan en una misma fila
+  facet_wrap(~ Label_Cluster, nrow = 1) + 
+  
+  scale_color_manual(values = colores_perfiles) +
+  scale_fill_manual(values = colores_perfiles) +
+  scale_x_discrete(labels = c(
+    "plusDEX_4D_L"  = "+DEX 4D light",
+    "minusDEX_3D_L" = "-DEX 3D light",
+    "minusDEX_4D_L" = "-DEX 4D light",
+    "minusDEX_4D_O" = "-DEX 4D dark"
+  )) +
+  labs(
+    x = "",
+    y = "Z-score (Media ± SD)"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold", color = "black"),
+    axis.text.y = element_text(color = "black"),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(size = 12, face = "bold")
+  )
+```
+
+## ENRIQUECIMIENTO
+
+```{r}
+# 1. Metemos los genes en la lista creando 6 apartados directamente
+lista_clusters_heatmap <- list(
+  "Cluster 1" = names(clusters_brutos[clusters_nuevos == 1]),
+  "Cluster 2" = names(clusters_brutos[clusters_nuevos == 2]),
+  "Cluster 3" = names(clusters_brutos[clusters_nuevos == 3]),
+  "Cluster 4" = names(clusters_brutos[clusters_nuevos == 4]),
+  "Cluster 5" = names(clusters_brutos[clusters_nuevos == 5]),
+  "Cluster 6" = c
+)
+
+library(clusterProfiler)
+library(org.At.tair.db)
+library(ggplot2)
+library(stringr)
+library(dplyr)
+library(DOSE) # Necesario para calcular el Fold Enrichment
+
+# 2. Ejecutamos el enriquecimiento para los 6 clústeres a la vez
+comparacion_clusters_go <- compareCluster(
+  geneCluster   = lista_clusters_heatmap,
+  fun           = "enrichGO",
+  OrgDb         = org.At.tair.db,
+  ont           = "BP",            # Procesos Biológicos
+  keyType       = "TAIR",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05
+)
+
+# 3. Calculamos el Fold Enrichment matemáticamente
+comparacion_clusters_go_FE <- mutate(comparacion_clusters_go, 
+                                     FoldEnrichment = parse_ratio(GeneRatio) / parse_ratio(BgRatio))
+
+# Dibujamos el Dotplot separando cada clúster en su propio panel
+dotplot(comparacion_clusters_go_FE, x = "FoldEnrichment", showCategory = 5) + 
+  
+  # ESTA ES LA CLAVE: Crea una "caja" o panel independiente para cada clúster
+  facet_wrap(~ Cluster, nrow = 1, scales = "free_x") + 
+  
+  scale_y_discrete(labels = function(x) str_wrap(x, width = 45)) + 
+  theme_bw(base_size = 14) +
+  labs(
+    title = "GO Biological Processes by Cluster",
+    x = "Fold Enrichment",
+    y = ""
+  ) +
+  theme(
+    axis.text.y = element_text(size = 10, lineheight = 0.8), 
+    axis.text.x = element_text(size = 10),
+    # Le damos un formato elegante a los títulos de cada panel
+    strip.text = element_text(face = "bold", size = 12),
+    strip.background = element_rect(fill = "white", color = "black") 
+  )
+```

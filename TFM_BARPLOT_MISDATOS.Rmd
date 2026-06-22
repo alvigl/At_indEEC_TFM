@@ -1,0 +1,166 @@
+---
+title: "TFM_BARPLOT_MISDATOS"
+output: pdf_document
+date: "2026-04-29"
+knitr:
+  opts_chunk: 
+    message: false
+    warning: false
+---
+
+```{r}
+# 1. Leer la matriz original
+# row.names = 1 le dice que la primera columna son los nombres de los genes (gene_id)
+matriz_cruda <- read.csv("matriz_genes.csv", row.names = 1)
+
+# 2. Seleccionar automáticamente solo 12 columnas
+# grep("DEX") busca todas las columnas que pertenecen a tu experimento
+columnas_tuyas <- grep("DEX", colnames(matriz_cruda), value = TRUE)
+matriz_12_replicas <- matriz_cruda[, columnas_tuyas]
+
+# Usamos grepl() para buscar "DEX". El símbolo "!" delante significa "TODO LO QUE NO TENGA"
+# columnas_embrion <- !grepl("DEX", colnames(matriz_completa))
+
+# Nos quedamos con todas las filas (espacio en blanco antes de la coma) 
+# # y solo con las columnas que superaron el filtro
+# matriz_embriones <- matriz_completa[, columnas_embrion]
+# 
+# # Eliminamos las dos columnas del mutante abc
+# matriz_embriones <- matriz_embriones[, -(1:2)]
+
+# Damos nombres a las columnas según los estadíos
+# Ahora sí, los 12 nombres de tus 12 réplicas
+nombres_nuevos <- c(
+  "minus_DEX_3D_L1", 
+  "minus_DEX_3D_L2",
+  "minus_DEX_4D_L1_1", 
+  "minus_DEX_4D_L1_2", 
+  "minus_DEX_4D_L2_1", 
+  "minus_DEX_4D_L2_2", 
+  "minus_DEX_4D_O1_1", 
+  "minus_DEX_4D_O1_2",
+  "minus_DEX_4D_O2_1", 
+  "minus_DEX_4D_O2_2",
+  "plus_DEX_4D_L1", 
+  "plus_DEX_4D_L2")
+
+colnames(matriz_12_replicas) <- nombres_nuevos
+
+# Limpiamos el ID de los genes
+rownames(matriz_12_replicas) <- gsub("\\|.*", "", rownames(matriz_embriones))
+
+# Normalizamos a CPM
+library(edgeR)
+matriz_embriones_norm <- cpm(matriz_12_replicas)
+```
+
+## BARPLOT
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# -------------------------------------------------------------------------
+# 1 & 2. FILTRADO Y PREPARACIÓN DE LA MATRIZ (Solo los 7 genes seleccionados)
+# -------------------------------------------------------------------------
+genes_interes <- c(
+  "AT5G59340" = "WOX2",
+  "AT3G20840" = "PLT1",
+  "AT1G51190" = "PLT2",
+  "AT1G21970" = "LEC1",
+  "AT1G28300" = "LEC2",
+  "AT3G26790" = "FUS3",
+  "AT5G45830" = "DOG1"
+)
+
+# Filtramos la matriz usando los IDs
+matriz_plot <- matriz_embriones_norm[rownames(matriz_embriones_norm) %in% names(genes_interes), ]
+matriz_plot <- as.data.frame(matriz_plot)
+
+# Añadimos los nombres comunes para la gráfica
+matriz_plot$GeneID <- rownames(matriz_plot)
+matriz_plot$GeneName <- genes_interes[matriz_plot$GeneID]
+
+# -------------------------------------------------------------------------
+# 3. AGRUPACIÓN Y CÁLCULO DE MEDIA + SEM (Error Estándar)
+# -------------------------------------------------------------------------
+resumen_barras_DEX <- matriz_plot %>%
+  pivot_longer(
+    cols = -c(GeneID, GeneName),
+    names_to = "Muestra",
+    values_to = "Expresion"
+  ) %>%
+  # Clasificamos cada réplica en su condición experimental definitiva
+  mutate(Condicion = case_when(
+    grepl("plus_DEX_4D_L", Muestra)  ~ "+DEX 4D_Light",
+    grepl("minus_DEX_3D_L", Muestra) ~ "-DEX 3D_Light",
+    grepl("minus_DEX_4D_L", Muestra) ~ "-DEX 4D_Light",
+    # Añadido un "0" numérico por si la matriz lo leyó así
+    grepl("minus_DEX_4D_O|minus_DEX_4D_0", Muestra) ~ "-DEX 4D_Dark" 
+  )) %>%
+  group_by(GeneName, Condicion) %>%
+  summarise(
+    Media = mean(Expresion, na.rm = TRUE),
+    SD = sd(Expresion, na.rm = TRUE),
+    n = sum(!is.na(Expresion)),       # Cuenta las réplicas
+    SEM = SD / sqrt(n),               # Calcula el SEM
+    .groups = "drop"
+  )
+
+# -------------------------------------------------------------------------
+# 4. ORDEN Y COLORES
+# -------------------------------------------------------------------------
+# Orden del eje X
+orden_genes <- c("WOX2", "PLT1", "PLT2", "LEC1", "LEC2", "FUS3", "DOG1")
+resumen_barras_DEX$GeneName <- factor(resumen_barras_DEX$GeneName, levels = orden_genes)
+
+# Orden de la leyenda
+orden_condiciones <- c("+DEX 4D_Light", "-DEX 3D_Light", "-DEX 4D_Light", "-DEX 4D_Dark")
+resumen_barras_DEX$Condicion <- factor(resumen_barras_DEX$Condicion, levels = orden_condiciones)
+
+# Colores del panel inferior
+colores_DEX <- c(
+  "+DEX 4D_Light" = "#EEDF9F", 
+  "-DEX 3D_Light" = "#A8C66C",
+  "-DEX 4D_Light" = "#00B050",
+  "-DEX 4D_Dark"  = "#000000"
+)
+
+# -------------------------------------------------------------------------
+# 5. GRÁFICO
+# -------------------------------------------------------------------------
+ggplot(resumen_barras_DEX, aes(x = GeneName, y = Media, fill = Condicion)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.75, color = "darkgray", linewidth = 0.2) +
+  
+  # Barras de error usando el SEM
+  geom_errorbar(aes(ymin = Media - SEM, ymax = Media + SEM),
+                position = position_dodge(width = 0.8), 
+                width = 0.25, color = "black", linewidth = 0.4) +
+  
+  scale_fill_manual(values = colores_DEX) +
+  
+  theme_classic() +
+  labs(title = "", x = "", y = "") + 
+  theme(
+    axis.text.x = element_text(face = "italic", color = "black", size = 14),
+    
+    axis.text.y = element_text(color = "black", size = 12),
+    
+    legend.text = element_text(size = 12),
+    
+    legend.title = element_blank(),
+    legend.position = c(0.15, 0.75), 
+    legend.background = element_blank(),
+    legend.key.size = unit(0.5, "cm")
+  )
+
+ggsave(
+  filename = "Barplot_MISDATOS.jpg", 
+  width    = 14,
+  height   = 7,
+  units    = "in",
+  dpi      = 600,
+  bg       = "white"
+)
+```

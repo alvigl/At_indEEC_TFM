@@ -1,0 +1,128 @@
+---
+title: "TFM_DNA_MOTIFS_2"
+output: html_document
+date: "2026-06-10"
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+# Instalamos biomaRt para descargar secuencias y Biostrings para el análisis de motivos
+BiocManager::install(c("Biostrings", "biomaRt"))
+BiocManager::install("BSgenome.Athaliana.TAIR.TAIR9")
+```
+
+```{r}
+library(Biostrings)
+library(biomaRt)
+library(dplyr)
+library(BSgenome.Athaliana.TAIR.TAIR9)
+
+# ==============================================================================
+# PASO 1: Obtener las coordenadas del TSS con biomaRt
+# ==============================================================================
+
+genes_target <- c("AT5G11260", "AT3G17609", "AT2G20570", "AT5G44190")
+nombres_genes <- c("HY5", "HYH", "GLK1", "GLK2")
+
+message("Conectando con Ensembl Plants para extraer coordenadas...")
+mart <- useMart("plants_mart", dataset = "athaliana_eg_gene", host = "https://plants.ensembl.org")
+
+coord_df <- getBM(
+  attributes = c("tair_locus", "chromosome_name", "strand", "transcript_start", "transcript_end"),
+  filters = "tair_locus",
+  values = genes_target,
+  mart = mart
+)
+
+coord_df <- coord_df %>%
+  group_by(tair_locus) %>%
+  slice(1) %>%
+  ungroup()
+
+# Calculamos la ventana (-1000 a +100) y adaptamos el formato para BSgenome
+coord_df <- coord_df %>%
+  mutate(
+    TSS = ifelse(strand == 1, transcript_start, transcript_end),
+    start_window = ifelse(strand == 1, TSS - 1000, TSS - 99),
+    end_window   = ifelse(strand == 1, TSS + 99, TSS + 1000),
+    gene_name    = nombres_genes[match(tair_locus, genes_target)],
+    
+    # Adaptación CRUCIAL: Ensembl devuelve cromosomas como "1", "2"... 
+    # pero BSgenome los necesita como "Chr1", "Chr2"...
+    chr_bsg      = paste0("Chr", chromosome_name),
+    
+    # Adaptación de la hebra: de 1/-1 a +/-
+    strand_bsg   = ifelse(strand == 1, "+", "-")
+  )
+
+
+# ==============================================================================
+# PASO 2: Extraer secuencias usando el genoma local (BSgenome)
+# ==============================================================================
+
+message("Extrayendo secuencias locales con BSgenome...")
+
+# La función getSeq es inteligente: si le pasas strand = "-", extrae el reverso complementario.
+promotores_seq <- getSeq(BSgenome.Athaliana.TAIR.TAIR9,
+                         names  = coord_df$chr_bsg,
+                         start  = coord_df$start_window,
+                         end    = coord_df$end_window,
+                         strand = coord_df$strand_bsg)
+
+# Nombramos las secuencias para que los resultados sean legibles
+names(promotores_seq) <- coord_df$gene_name
+
+
+# ==============================================================================
+# PASO 3: Definir el motivo de LEC1 y escanear
+# ==============================================================================
+
+motivo_consenso <- "CCAAT"
+
+buscar_sitios_union <- function(seqs, motivo) {
+  resultados <- data.frame()
+  
+  for (nombre_gen in names(seqs)) {
+    secuencia <- seqs[[nombre_gen]]
+    
+    # Búsqueda en la Hebra Forward (+)
+    matches_fwd <- matchPattern(motivo, secuencia, max.mismatch = 0)
+    if (length(matches_fwd) > 0) {
+      resultados <- rbind(resultados, data.frame(
+        Gen = nombre_gen, Strand = "+", Start = start(matches_fwd), 
+        End = end(matches_fwd), Sequence = as.character(matches_fwd)
+      ))
+    }
+    
+    # Búsqueda en la Hebra Reverse (-)
+    motivo_rev_comp <- as.character(reverseComplement(DNAString(motivo)))
+    matches_rev <- matchPattern(motivo_rev_comp, secuencia, max.mismatch = 0)
+    if (length(matches_rev) > 0) {
+      resultados <- rbind(resultados, data.frame(
+        Gen = nombre_gen, Strand = "-", Start = start(matches_rev), 
+        End = end(matches_rev), Sequence = as.character(reverseComplement(matches_rev))
+      ))
+    }
+  }
+  return(resultados)
+}
+
+tabla_resultados <- buscar_sitios_union(promotores_seq, motivo_consenso)
+
+
+# ==============================================================================
+# PASO 4: Interpretar y exportar
+# ==============================================================================
+
+print("Sitios de unión candidatos encontrados (-1000 a +100):")
+print(tabla_resultados)
+
+write.csv(tabla_resultados, "Resultados_Promotores_LEC1_TFM.csv", row.names = FALSE)
+```
